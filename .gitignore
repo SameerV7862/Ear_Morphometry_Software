@@ -1,0 +1,6 @@
+.cache/
+runs/
+__pycache__/
+*.pyc
+.pytest_cache/
+BabyEar4k.zip
