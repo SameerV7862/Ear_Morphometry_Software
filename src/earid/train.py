@@ -5,17 +5,26 @@ import json
 import math
 import random
 import statistics
+from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torchvision import transforms
 from tqdm import tqdm
 
-from .data import EarDataset, build_manifest_digest, discover_samples, prepare_dataset, save_manifest, split_samples
+from .data import (
+    EarDataset,
+    build_manifest_digest,
+    discover_samples,
+    limit_samples_per_identity,
+    prepare_dataset,
+    save_manifest,
+    split_samples,
+)
 from .metrics import classification_metrics
 from .models import build_model, load_matching_state_dict
 
@@ -40,6 +49,7 @@ class TrainConfig:
     num_workers: int
     device: str
     init_checkpoint: str | None = None
+    max_samples_per_identity: int | None = None
 
 
 @dataclass
@@ -167,6 +177,9 @@ def load_samples(config: TrainConfig):
     cache_dir = Path(config.cache_dir)
     prepared_root = prepare_dataset(source_path, cache_dir)
     samples = discover_samples(prepared_root, include_full_face=config.include_full_face)
+    samples = limit_samples_per_identity(
+        samples, config.max_samples_per_identity, config.seed
+    )
     if not samples:
         raise ValueError(f"No images found in {prepared_root}")
     label_to_index = {label: idx for idx, label in enumerate(sorted({s.label for s in samples}))}
@@ -178,6 +191,14 @@ def train_single_run(config: TrainConfig) -> dict[str, float]:
     output_dir = Path(config.output_dir)
     _, samples, label_to_index = load_samples(config)
     splits = split_samples(samples, config.val_ratio, config.test_ratio, config.seed)
+    for split_name in ("train", "val", "test"):
+        if not splits[split_name]:
+            raise ValueError(
+                f"{split_name} split is empty. Individual-identification "
+                "training requires identities with at least three images. "
+                "Two-image morphology datasets such as BabyEar4k cannot "
+                "provide a valid same-person train/validation/test protocol."
+            )
 
     save_manifest(samples, output_dir / "manifest.csv")
 
@@ -185,7 +206,24 @@ def train_single_run(config: TrainConfig) -> dict[str, float]:
     val_ds = EarDataset(splits["val"], transform=build_transforms(config.image_size, False))
     test_ds = EarDataset(splits["test"], transform=build_transforms(config.image_size, False))
 
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers, pin_memory=torch.cuda.is_available())
+    # Balance datasets first and identities second so a large source corpus
+    # cannot dominate smaller cohorts even when classes are frequency-balanced.
+    class_counts: dict[int, int] = {}
+    class_domains: dict[int, str] = {}
+    for s in splits["train"]:
+        class_counts[s.label_index] = class_counts.get(s.label_index, 0) + 1
+        class_domains[s.label_index] = s.label.split("/", 1)[0]
+    domain_class_counts = Counter(class_domains.values())
+    sample_weights = [
+        1.0
+        / (
+            domain_class_counts[class_domains[s.label_index]]
+            * class_counts[s.label_index]
+        )
+        for s in splits["train"]
+    ]
+    train_sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+    train_loader = DataLoader(train_ds, batch_size=config.batch_size, sampler=train_sampler, num_workers=config.num_workers, pin_memory=torch.cuda.is_available())
     val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=torch.cuda.is_available())
     test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=torch.cuda.is_available())
 

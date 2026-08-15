@@ -12,7 +12,12 @@ from torch import nn
 from torch.utils.data import DataLoader
 from torchvision import transforms
 
-from .data import discover_samples, prepare_dataset
+from .data import (
+    discover_samples,
+    limit_samples_per_identity,
+    prepare_dataset,
+    split_samples,
+)
 from .models import build_model, extract_embeddings
 from .train import TrainConfig, finetune, train, train_monte_carlo
 
@@ -35,6 +40,11 @@ def _common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--max-samples-per-identity",
+        type=int,
+        help="Deterministically cap images per person for large datasets",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,12 +79,16 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--batch-size", type=int, default=16)
     eval_parser.add_argument("--num-workers", type=int, default=2)
     eval_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    eval_parser.add_argument("--calibration-bins", type=int, default=10)
+    eval_parser.add_argument("--output-json", help="Optional path for detailed evaluation metrics")
 
     predict_parser = subparsers.add_parser("predict", help="Predict identity for one image")
     predict_parser.add_argument("--checkpoint", required=True)
     predict_parser.add_argument("--image", required=True)
     predict_parser.add_argument("--image-size", type=int, default=224)
     predict_parser.add_argument("--tta", type=int, default=1, help="Number of test-time augmentation passes")
+    predict_parser.add_argument("--reject-below", type=float, help="Return no-decision below this confidence")
+    predict_parser.add_argument("--temperature", type=float, default=1.0, help="Validation-fitted calibration temperature")
     predict_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
     cross_parser = subparsers.add_parser("cross-test", help="Cross-dataset identification using embeddings")
@@ -84,6 +98,21 @@ def build_parser() -> argparse.ArgumentParser:
     cross_parser.add_argument("--include-full-face", action="store_true")
     cross_parser.add_argument("--image-size", type=int, default=224)
     cross_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+
+    open_set_parser = subparsers.add_parser(
+        "open-set-test",
+        help="Evaluate enrolled identities against separate unknown identities",
+    )
+    open_set_parser.add_argument("--known-source", required=True)
+    open_set_parser.add_argument("--unknown-validation-source", required=True)
+    open_set_parser.add_argument("--unknown-test-source", required=True)
+    open_set_parser.add_argument("--checkpoint", required=True)
+    open_set_parser.add_argument("--cache-dir", default=".cache")
+    open_set_parser.add_argument("--image-size", type=int, default=224)
+    open_set_parser.add_argument("--batch-size", type=int, default=16)
+    open_set_parser.add_argument("--target-far", type=float, default=0.01)
+    open_set_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    open_set_parser.add_argument("--output-json")
 
     validate_parser = subparsers.add_parser("validate", help="Smoke test the data pipeline and model")
     validate_parser.add_argument("--source", required=True)
@@ -151,6 +180,43 @@ def _mean_normalize(vectors: torch.Tensor) -> torch.Tensor:
     return vectors
 
 
+def _select_open_set_threshold(
+    known_scores,
+    known_predictions,
+    known_labels,
+    unknown_scores,
+    target_far: float,
+) -> float:
+    known_scores = np.asarray(known_scores, dtype=np.float64)
+    known_predictions = np.asarray(known_predictions)
+    known_labels = np.asarray(known_labels)
+    unknown_scores = np.asarray(unknown_scores, dtype=np.float64)
+    if known_scores.size == 0 or unknown_scores.size == 0:
+        raise ValueError("Threshold selection requires known and unknown samples")
+
+    candidate_scores = np.unique(np.concatenate([known_scores, unknown_scores]))
+    thresholds = np.concatenate(
+        [[float("-inf")], np.nextafter(candidate_scores, float("inf"))]
+    )
+    valid_candidates = []
+    for threshold in thresholds:
+        false_accept_rate = float((unknown_scores >= threshold).mean())
+        if false_accept_rate > target_far:
+            continue
+        identification_rate = float(
+            (
+                (known_predictions == known_labels)
+                & (known_scores >= threshold)
+            ).mean()
+        )
+        valid_candidates.append(
+            (identification_rate, -false_accept_rate, -threshold, threshold)
+        )
+    if not valid_candidates:
+        raise RuntimeError("No threshold satisfies the requested validation FAR")
+    return float(max(valid_candidates)[-1])
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -184,6 +250,7 @@ def main(argv: list[str] | None = None) -> None:
                 patience=args.patience,
                 num_workers=args.num_workers,
                 device=args.device,
+                max_samples_per_identity=args.max_samples_per_identity,
             )
         )
         print(json.dumps(metrics, indent=2))
@@ -210,6 +277,7 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=args.num_workers,
                 device=args.device,
                 init_checkpoint=args.init_checkpoint,
+                max_samples_per_identity=args.max_samples_per_identity,
             )
         )
         print(json.dumps(metrics, indent=2))
@@ -235,6 +303,7 @@ def main(argv: list[str] | None = None) -> None:
                 patience=args.patience,
                 num_workers=args.num_workers,
                 device=args.device,
+                max_samples_per_identity=args.max_samples_per_identity,
             ),
             runs=args.mc_runs,
             seed_step=args.mc_seed_step,
@@ -245,32 +314,124 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "evaluate":
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         root = prepare_dataset(Path(args.source), Path(args.cache_dir))
-        samples = discover_samples(root, include_full_face=args.include_full_face)
+        checkpoint_config = checkpoint["config"]
+        samples = discover_samples(
+            root,
+            include_full_face=checkpoint_config.get("include_full_face", False),
+        )
+        samples = limit_samples_per_identity(
+            samples,
+            checkpoint_config.get("max_samples_per_identity"),
+            checkpoint_config["seed"],
+        )
 
         from torch.utils.data import DataLoader
 
-        from .data import EarDataset, split_samples
-        from .metrics import classification_metrics
+        from .data import EarDataset
+        from .metrics import identification_metrics
 
-        splits = split_samples(samples, 0.2, 0.2, 42)
+        splits = split_samples(
+            samples,
+            checkpoint_config["val_ratio"],
+            checkpoint_config["test_ratio"],
+            checkpoint_config["seed"],
+        )
+        val_ds = EarDataset(splits["val"], transform=_build_eval_transforms(args.image_size))
         test_ds = EarDataset(splits["test"], transform=_build_eval_transforms(args.image_size))
-        loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+        test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         device = torch.device(args.device)
         model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
-        all_preds = []
-        all_targets = []
-        with torch.no_grad():
-            for images, targets, _ in loader:
-                images = images.to(device)
-                logits = model(images)
-                all_preds.extend(logits.argmax(dim=1).cpu().tolist())
-                all_targets.extend(targets.tolist())
-        print(json.dumps(classification_metrics(all_targets, all_preds), indent=2))
+
+        def collect_logits(loader):
+            batches = []
+            targets = []
+            paths = []
+            with torch.no_grad():
+                for images, batch_targets, batch_paths in loader:
+                    batches.append(model(images.to(device)).cpu())
+                    targets.extend(batch_targets.tolist())
+                    paths.extend(batch_paths)
+            return torch.cat(batches), torch.tensor(targets), paths
+
+        val_logits, val_targets, _ = collect_logits(val_loader)
+        test_logits, test_targets, all_paths = collect_logits(test_loader)
+
+        # Fit one scalar temperature on validation data only. This changes
+        # confidence calibration, never class ranking or identity accuracy.
+        log_temperature = torch.nn.Parameter(torch.zeros(1))
+        temperature_optimizer = torch.optim.LBFGS(
+            [log_temperature], lr=0.05, max_iter=50
+        )
+
+        def calibration_closure():
+            temperature_optimizer.zero_grad()
+            loss = torch.nn.functional.cross_entropy(
+                val_logits / log_temperature.exp(), val_targets
+            )
+            loss.backward()
+            return loss
+
+        temperature_optimizer.step(calibration_closure)
+        temperature = float(log_temperature.exp().detach().item())
+        uncalibrated_probabilities = torch.softmax(test_logits, dim=1).numpy()
+        probabilities = torch.softmax(test_logits / temperature, dim=1).numpy()
+        all_targets = test_targets.tolist()
+        metrics = identification_metrics(
+            probabilities, all_targets, num_bins=args.calibration_bins
+        )
+        uncalibrated = identification_metrics(
+            uncalibrated_probabilities, all_targets, num_bins=args.calibration_bins
+        )
+        metrics["temperature_scaling"] = {
+            "temperature": temperature,
+            "fit_split": "validation",
+            "uncalibrated_mean_confidence": uncalibrated["mean_confidence"],
+            "uncalibrated_expected_calibration_error": uncalibrated[
+                "expected_calibration_error"
+            ],
+            "uncalibrated_negative_log_likelihood": uncalibrated[
+                "negative_log_likelihood"
+            ],
+        }
+        predictions = probabilities.argmax(axis=1)
+        confidence = probabilities.max(axis=1)
+        sample_by_path = {str(sample.path): sample for sample in samples}
+        index_to_label = {index: label for label, index in checkpoint["label_to_index"].items()}
+
+        def summarize_groups(groups):
+            summaries = {}
+            for group in sorted(set(groups)):
+                indices = np.asarray([value == group for value in groups])
+                summaries[group] = {
+                    "count": int(indices.sum()),
+                    "accuracy": float(
+                        (predictions[indices] == np.asarray(all_targets)[indices]).mean()
+                    ),
+                    "mean_confidence": float(confidence[indices].mean()),
+                }
+            return summaries
+
+        dataset_groups = [
+            index_to_label[target].split("/", 1)[0] for target in all_targets
+        ]
+        audit_groups = [sample_by_path[path].race for path in all_paths]
+        metrics["subgroups"] = {
+            "dataset": summarize_groups(dataset_groups),
+            "demographic_metadata": summarize_groups(audit_groups),
+        }
+        if args.output_json:
+            output_path = Path(args.output_json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        print(json.dumps(metrics, indent=2))
         return
 
     if args.command == "predict":
+        if args.temperature <= 0:
+            raise ValueError("--temperature must be greater than zero")
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         device = torch.device(args.device)
         model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False).to(device)
@@ -291,11 +452,17 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 image = transform(base_image).unsqueeze(0).to(device)
                 logits = model(image)
-            probs = torch.softmax(logits, dim=1).squeeze(0)
+            probs = torch.softmax(logits / args.temperature, dim=1).squeeze(0)
             topk = torch.topk(probs, k=min(5, probs.numel()))
+        top_probability = float(topk.values[0])
+        accepted = args.reject_below is None or top_probability >= args.reject_below
         print(
             json.dumps(
                 {
+                    "decision": inv_labels[int(topk.indices[0])] if accepted else "no_decision",
+                    "accepted": accepted,
+                    "rejection_threshold": args.reject_below,
+                    "temperature": args.temperature,
                     "top_predictions": [
                         {"label": inv_labels[int(idx)], "probability": float(prob)}
                         for prob, idx in zip(topk.values.tolist(), topk.indices.tolist(), strict=False)
@@ -306,10 +473,176 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
+    if args.command == "open-set-test":
+        if not 0 <= args.target_far <= 1:
+            raise ValueError("--target-far must be between zero and one")
+        checkpoint = torch.load(args.checkpoint, map_location=args.device)
+        checkpoint_config = checkpoint["config"]
+        known_root = prepare_dataset(Path(args.known_source), Path(args.cache_dir))
+        unknown_val_root = prepare_dataset(
+            Path(args.unknown_validation_source), Path(args.cache_dir)
+        )
+        unknown_test_root = prepare_dataset(
+            Path(args.unknown_test_source), Path(args.cache_dir)
+        )
+        known_samples = discover_samples(
+            known_root,
+            include_full_face=checkpoint_config.get("include_full_face", False),
+        )
+        known_samples = limit_samples_per_identity(
+            known_samples,
+            checkpoint_config.get("max_samples_per_identity"),
+            checkpoint_config["seed"],
+        )
+        unknown_val_samples = discover_samples(unknown_val_root)
+        unknown_test_samples = discover_samples(unknown_test_root)
+        known_splits = split_samples(
+            known_samples,
+            checkpoint_config["val_ratio"],
+            checkpoint_config["test_ratio"],
+            checkpoint_config["seed"],
+        )
+        checkpoint_labels = set(checkpoint["label_to_index"])
+        known_labels = {sample.label for sample in known_samples}
+        if checkpoint_labels != known_labels:
+            raise ValueError(
+                "Known-source identities do not match the checkpoint classifier"
+            )
+        if known_labels & {
+            sample.label for sample in unknown_val_samples + unknown_test_samples
+        }:
+            raise ValueError("Unknown identities overlap the enrolled identities")
+
+        device = torch.device(args.device)
+        backbone = checkpoint_config["backbone"]
+        model = build_model(
+            backbone,
+            num_classes=len(checkpoint["label_to_index"]),
+            pretrained=False,
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        model.eval()
+
+        def encode(samples):
+            loader = _embedding_loader(
+                samples,
+                args.image_size,
+                batch_size=args.batch_size,
+                num_workers=0,
+            )
+            embeddings = []
+            labels = []
+            with torch.no_grad():
+                for images, batch_labels, _, _ in loader:
+                    features = extract_embeddings(
+                        model, backbone, images.to(device)
+                    ).cpu()
+                    embeddings.append(torch.nn.functional.normalize(features, dim=1))
+                    labels.extend(batch_labels)
+            return torch.cat(embeddings), labels
+
+        gallery_embeddings, gallery_labels = encode(known_splits["train"])
+        identity_order = sorted(set(gallery_labels))
+        centroids = []
+        for identity in identity_order:
+            identity_indices = [
+                index
+                for index, label in enumerate(gallery_labels)
+                if label == identity
+            ]
+            centroid = gallery_embeddings[identity_indices].mean(dim=0)
+            centroids.append(torch.nn.functional.normalize(centroid, dim=0))
+        centroid_matrix = torch.stack(centroids)
+
+        def score(samples):
+            embeddings, labels = encode(samples)
+            similarities = embeddings @ centroid_matrix.T
+            best_scores, best_indices = similarities.max(dim=1)
+            predictions = [identity_order[index] for index in best_indices.tolist()]
+            return (
+                np.asarray(best_scores.tolist(), dtype=np.float64),
+                np.asarray(predictions),
+                np.asarray(labels),
+            )
+
+        known_val_scores, known_val_predictions, known_val_labels = score(
+            known_splits["val"]
+        )
+        unknown_val_scores, _, _ = score(unknown_val_samples)
+        threshold = _select_open_set_threshold(
+            known_val_scores,
+            known_val_predictions,
+            known_val_labels,
+            unknown_val_scores,
+            args.target_far,
+        )
+
+        known_test_scores, known_test_predictions, known_test_labels = score(
+            known_splits["test"]
+        )
+        unknown_test_scores, _, unknown_test_labels = score(unknown_test_samples)
+
+        def operating_metrics(scores, predictions, labels):
+            accepted = scores >= threshold
+            correct = predictions == labels
+            return {
+                "samples": int(labels.size),
+                "rank_1_accuracy": float(correct.mean()),
+                "acceptance_rate": float(accepted.mean()),
+                "identification_rate": float((accepted & correct).mean()),
+                "false_identification_rate": float((accepted & ~correct).mean()),
+                "rejection_rate": float((~accepted).mean()),
+            }
+
+        results = {
+            "threshold_selection": {
+                "target_false_accept_rate": args.target_far,
+                "cosine_similarity_threshold": float(threshold),
+                "unknown_validation_identities": len(
+                    {sample.label for sample in unknown_val_samples}
+                ),
+                "unknown_validation_samples": len(unknown_val_samples),
+                "observed_validation_false_accept_rate": float(
+                    (unknown_val_scores >= threshold).mean()
+                ),
+                "known_validation_identification_rate": float(
+                    (
+                        (known_val_predictions == known_val_labels)
+                        & (known_val_scores >= threshold)
+                    ).mean()
+                ),
+            },
+            "known_test": operating_metrics(
+                known_test_scores, known_test_predictions, known_test_labels
+            ),
+            "unknown_test": {
+                "identities": len(set(unknown_test_labels.tolist())),
+                "samples": int(unknown_test_labels.size),
+                "false_accept_rate": float(
+                    (unknown_test_scores >= threshold).mean()
+                ),
+                "true_reject_rate": float(
+                    (unknown_test_scores < threshold).mean()
+                ),
+                "mean_max_similarity": float(unknown_test_scores.mean()),
+                "maximum_similarity": float(unknown_test_scores.max()),
+            },
+            "gallery": {
+                "identities": len(identity_order),
+                "images": len(gallery_labels),
+            },
+        }
+        if args.output_json:
+            output_path = Path(args.output_json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(json.dumps(results, indent=2))
+        return
+
     if args.command == "validate":
         root = prepare_dataset(Path(args.source), Path(args.cache_dir))
         samples = discover_samples(root, include_full_face=args.include_full_face)
-        from .data import EarDataset, split_samples
+        from .data import EarDataset
         from torch.utils.data import DataLoader
 
         splits = split_samples(samples, 0.2, 0.2, 42)

@@ -44,6 +44,45 @@ def is_image_file(path: Path) -> bool:
     return path.suffix.lower() in IMAGE_EXTENSIONS
 
 
+def infer_identity(root: Path, path: Path) -> tuple[str, str, str]:
+    rel = path.relative_to(root)
+    parts = rel.parts
+    stem_subject = path.stem.split("_")[0]
+    root_name = root.name.lower()
+    top_level = parts[0].lower() if parts else ""
+    babyear4k_layout = (root / "health_data.csv").is_file() and (
+        root / "images"
+    ).is_dir()
+
+    if top_level == "ami" or top_level.startswith("subset-") or "ami" in root_name:
+        return f"ami/{stem_subject}", "AMI", stem_subject
+
+    if top_level == "earvn" or "earvn" in root_name:
+        subject_id = path.parent.name
+        return f"earvn/{subject_id}", "EarVN1.0", subject_id
+
+    if top_level in {"ibug", "collectionb"} or "ibug" in root_name:
+        subject_id = path.parent.name
+        return f"ibug/{subject_id}", "iBUG", subject_id
+
+    if babyear4k_layout or top_level == "babyear4k" or "babyear4k" in root_name:
+        return f"babyear4k/{stem_subject}", "BabyEar4k", stem_subject
+
+    if top_level == "current" and len(parts) >= 4:
+        subject_id = parts[-2]
+        return f"current/{subject_id}", parts[-3], subject_id
+
+    if len(parts) >= 3:
+        label = "/".join(parts[:-1])
+        return label, parts[-3], parts[-2]
+    if len(parts) == 2:
+        subject_id = parts[0] if parts[0].isdigit() else stem_subject
+        return subject_id, parts[0], subject_id
+    if len(parts) == 1:
+        return stem_subject, root.name, stem_subject
+    raise ValueError(f"Cannot infer identity from {path}")
+
+
 def prepare_dataset(source: Path, cache_dir: Path) -> Path:
     source = source.expanduser().resolve()
     cache_dir = cache_dir.expanduser().resolve()
@@ -69,51 +108,23 @@ def prepare_dataset(source: Path, cache_dir: Path) -> Path:
 
 def discover_samples(root: Path, include_full_face: bool = False) -> list[Sample]:
     root = root.expanduser().resolve()
-    labels = set()
-    image_paths: list[Path] = []
+    discovered: list[tuple[Path, str, str, str, str]] = []
     for dirpath, _, filenames in os.walk(root, followlinks=True):
         for filename in filenames:
             path = Path(dirpath) / filename
             if not is_image_file(path):
                 continue
-            image_paths.append(path)
-            rel = path.relative_to(root)
-            parts = rel.parts
-            if len(parts) >= 3:
-                labels.add("/".join(parts[:-1]))
-            elif len(parts) == 2:
-                labels.add(parts[0] if parts[0].isdigit() else path.stem.split("_")[0])
-            elif len(parts) == 1:
-                labels.add(path.stem.split("_")[0])
-    labels = sorted(labels)
+            view_type = infer_view_type(path)
+            if not include_full_face and view_type == "full_face":
+                continue
+            label, race, subject_id = infer_identity(root, path)
+            discovered.append((path, label, race, subject_id, view_type))
+
+    labels = sorted({item[1] for item in discovered})
     label_to_index = {label: idx for idx, label in enumerate(labels)}
 
     samples: list[Sample] = []
-    for path in sorted(image_paths):
-        rel = path.relative_to(root)
-        parts = rel.parts
-        if len(parts) >= 3:
-            label = "/".join(parts[:-1])
-        elif len(parts) == 2:
-            label = parts[0] if parts[0].isdigit() else path.stem.split("_")[0]
-        elif len(parts) == 1:
-            label = path.stem.split("_")[0]
-        else:
-            continue
-        if label not in label_to_index:
-            continue
-        view_type = infer_view_type(path)
-        if not include_full_face and view_type == "full_face":
-            continue
-        if len(parts) >= 3:
-            race = parts[0]
-            subject_id = parts[1]
-        elif len(parts) == 2:
-            race = parts[0]
-            subject_id = label
-        else:
-            race = root.name
-            subject_id = label
+    for path, label, race, subject_id, view_type in sorted(discovered):
         samples.append(
             Sample(
                 path=path,
@@ -145,6 +156,30 @@ def save_manifest(samples: Iterable[Sample], output_path: Path) -> None:
             )
 
 
+def limit_samples_per_identity(
+    samples: list[Sample], maximum: int | None, seed: int
+) -> list[Sample]:
+    if maximum is None:
+        return samples
+    if maximum < 1:
+        raise ValueError("maximum samples per identity must be at least one")
+
+    by_label: dict[str, list[Sample]] = {}
+    for sample in samples:
+        by_label.setdefault(sample.label, []).append(sample)
+
+    selected = []
+    for label, label_samples in sorted(by_label.items()):
+        ordered = sorted(label_samples, key=lambda sample: str(sample.path))
+        if len(ordered) > maximum:
+            rng = random.Random(f"{seed}:{label}")
+            ordered = sorted(
+                rng.sample(ordered, maximum), key=lambda sample: str(sample.path)
+            )
+        selected.extend(ordered)
+    return selected
+
+
 def split_samples(
     samples: list[Sample],
     val_ratio: float,
@@ -169,11 +204,18 @@ def split_samples(
         shuffled = label_samples[:]
         rng.shuffle(shuffled)
         n = len(shuffled)
+        # Classes with fewer than 3 images cannot support a valid held-out
+        # evaluation (e.g. a subject with only one left-ear and one right-ear
+        # image would be trained on one ear and tested on a physically
+        # different ear). Use them as training-only diversity data.
+        if n < 3:
+            train.extend(shuffled)
+            continue
         n_test = max(1, round(n * test_ratio))
         n_val = max(1, round(n * val_ratio))
         if n_test + n_val >= n:
             n_test = 1
-            n_val = 1 if n >= 3 else 0
+            n_val = 1
         n_train = n - n_val - n_test
         if n_train <= 0:
             raise ValueError("Split ratios leave no training samples for at least one class")
