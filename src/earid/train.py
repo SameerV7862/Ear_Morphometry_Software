@@ -258,6 +258,17 @@ def train_single_run(config: TrainConfig) -> dict[str, float]:
             }
             best_state = copy.deepcopy(model.state_dict())
             bad_epochs = 0
+            # Persist the best checkpoint immediately so an interrupted run
+            # never loses completed training progress.
+            torch.save(
+                {
+                    "model_state_dict": best_state,
+                    "label_to_index": label_to_index,
+                    "config": asdict(config),
+                    "best_metrics": best_metrics,
+                },
+                output_dir / "checkpoint_best_val.pt",
+            )
         else:
             bad_epochs += 1
             if bad_epochs >= config.patience:
