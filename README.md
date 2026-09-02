@@ -140,6 +140,17 @@ This gallery/probe test uses one image per identity as the gallery and all
 remaining images as probes. Run it before training on a new dataset to preserve
 an uncontaminated domain-transfer baseline.
 
+## Comparison UI
+
+```bash
+earid ui --checkpoint runs/earid/checkpoint.pt --port 7860
+```
+
+Opens a local web app: upload one reference ear photo on the left, drop
+hundreds of candidate photos on the right, and swipe through them ranked by
+embedding cosine similarity (arrow keys, swipe, or the thumbnail strip).
+Scores are investigative-lead indicators, not identity conclusions.
+
 ## Notes
 
 - The `resnet18` backbone is the recommended default for the small provided dataset.
