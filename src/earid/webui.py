@@ -14,9 +14,16 @@ import json
 from pathlib import Path
 
 import torch
-from flask import Flask, jsonify, render_template_string, request
-from PIL import Image
+from flask import Flask, Response, jsonify, render_template_string, request
+from PIL import Image, ImageOps
 from torchvision import transforms
+
+try:  # enable HEIC/HEIF uploads (iPhone photos) when pillow-heif is installed
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except ImportError:  # pragma: no cover - optional dependency
+    pass
 
 from .models import build_model, extract_embeddings
 
@@ -73,7 +80,7 @@ PAGE = """<!doctype html>
   <section class="panel">
     <h2>Reference photo</h2>
     <label class="drop" id="refDrop">
-      <input type="file" id="refInput" accept="image/*">
+      <input type="file" id="refInput" accept="image/*,.heic,.heif">
       <div>Click or drop the reference ear photo</div>
       <small id="refName">No file selected</small>
     </label>
@@ -84,7 +91,7 @@ PAGE = """<!doctype html>
   <section class="panel">
     <h2>Candidate gallery</h2>
     <label class="drop" id="candDrop">
-      <input type="file" id="candInput" accept="image/*" multiple>
+      <input type="file" id="candInput" accept="image/*,.heic,.heif" multiple>
       <div>Click or drop hundreds of candidate photos</div>
       <small id="candCount">No files selected</small>
     </label>
@@ -112,6 +119,19 @@ const candInput = document.getElementById('candInput');
 const rankBtn = document.getElementById('rankBtn');
 const statusEl = document.getElementById('status');
 let refFile = null, candFiles = [], ranked = [], urls = [], pos = 0;
+const HEIC = /\\.(heic|heif)$/i;
+const isImage = f => f.type.startsWith('image/') || HEIC.test(f.name);
+
+// Browsers cannot decode HEIC/HEIF; ask the server for a JPEG preview instead.
+async function previewURL(file) {
+  const needsConvert = HEIC.test(file.name) || file.type === 'image/heic' || file.type === 'image/heif';
+  if (!needsConvert) return URL.createObjectURL(file);
+  const form = new FormData();
+  form.append('image', file);
+  const res = await fetch('/api/preview', { method: 'POST', body: form });
+  if (!res.ok) return URL.createObjectURL(file);
+  return URL.createObjectURL(await res.blob());
+}
 
 function hook(dropId, inputEl, onFiles) {
   const drop = document.getElementById(dropId);
@@ -119,18 +139,18 @@ function hook(dropId, inputEl, onFiles) {
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', e => {
     e.preventDefault(); drop.classList.remove('over');
-    onFiles([...e.dataTransfer.files].filter(f => f.type.startsWith('image/')));
+    onFiles([...e.dataTransfer.files].filter(isImage));
   });
-  inputEl.addEventListener('change', () => onFiles([...inputEl.files]));
+  inputEl.addEventListener('change', () => onFiles([...inputEl.files].filter(isImage)));
 }
 
-hook('refDrop', refInput, files => {
+hook('refDrop', refInput, async files => {
   if (!files.length) return;
   refFile = files[0];
   document.getElementById('refName').textContent = refFile.name;
   const img = document.getElementById('refPreview');
-  img.src = URL.createObjectURL(refFile);
   img.style.display = 'block';
+  img.src = await previewURL(refFile);
   updateButton();
 });
 
@@ -154,8 +174,9 @@ rankBtn.addEventListener('click', async () => {
     if (!res.ok) throw new Error((await res.json()).error || res.statusText);
     const data = await res.json();
     ranked = data.ranking;
+    statusEl.textContent = 'Preparing previews…';
     urls.forEach(u => URL.revokeObjectURL(u));
-    urls = candFiles.map(f => URL.createObjectURL(f));
+    urls = await Promise.all(candFiles.map(previewURL));
     pos = 0;
     buildThumbs();
     show();
@@ -267,7 +288,7 @@ def create_app(checkpoint_path: Path, device_name: str = "cpu", batch_size: int 
 
         def to_tensor(storage) -> torch.Tensor:
             with Image.open(io.BytesIO(storage.read())) as image:
-                return transform(image.convert("RGB"))
+                return transform(ImageOps.exif_transpose(image).convert("RGB"))
 
         try:
             reference_tensor = to_tensor(reference)
@@ -282,6 +303,21 @@ def create_app(checkpoint_path: Path, device_name: str = "cpu", batch_size: int 
             {"index": i, "name": candidates[i].filename, "score": similarities[i]} for i in order
         ]
         return jsonify({"ranking": ranking, "seconds": time.time() - started})
+
+    @app.post("/api/preview")
+    def preview():
+        upload = request.files.get("image")
+        if upload is None:
+            return jsonify({"error": "Provide an image"}), 400
+        try:
+            with Image.open(io.BytesIO(upload.read())) as image:
+                image = ImageOps.exif_transpose(image).convert("RGB")
+                image.thumbnail((1280, 1280))
+                buffer = io.BytesIO()
+                image.save(buffer, "JPEG", quality=88)
+        except Exception as error:  # noqa: BLE001 - report unreadable uploads to the client
+            return jsonify({"error": f"Unreadable image: {error}"}), 400
+        return Response(buffer.getvalue(), mimetype="image/jpeg")
 
     return app
 
