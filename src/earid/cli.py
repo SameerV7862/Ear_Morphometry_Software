@@ -742,3 +742,7 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     raise RuntimeError(f"Unknown command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
