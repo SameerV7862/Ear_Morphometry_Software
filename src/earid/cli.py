@@ -123,6 +123,13 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--pretrained", action="store_true")
     validate_parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
 
+    ui_parser = subparsers.add_parser("ui", help="Launch the reference-vs-gallery comparison web UI")
+    ui_parser.add_argument("--checkpoint", required=True)
+    ui_parser.add_argument("--host", default="127.0.0.1")
+    ui_parser.add_argument("--port", type=int, default=7860)
+    ui_parser.add_argument("--device", default="cpu")
+    ui_parser.add_argument("--batch-size", type=int, default=16)
+
     return parser
 
 
@@ -220,6 +227,14 @@ def _select_open_set_threshold(
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    if args.command == "ui":
+        from .webui import create_app
+
+        app = create_app(Path(args.checkpoint), args.device, args.batch_size)
+        print(json.dumps({"url": f"http://{args.host}:{args.port}", "checkpoint": args.checkpoint}))
+        app.run(host=args.host, port=args.port)
+        return
 
     if args.command == "prepare":
         root = prepare_dataset(Path(args.source), Path(args.cache_dir))
