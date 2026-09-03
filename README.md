@@ -62,6 +62,34 @@ The optional per-identity cap is deterministic for the configured seed. It is
 useful for large, imbalanced datasets such as EarVN1.0 and is saved in the
 checkpoint configuration and manifest.
 
+Pass `--loss arcface` to train with an additive angular margin (ArcFace)
+head instead of plain cross-entropy. This directly optimizes the embedding
+space used for ranking and open-set matching. Checkpoints record the loss
+type, so evaluation, prediction, cross-testing, and the UI all reload the
+right architecture automatically.
+
+## Ear alignment
+
+Pose and scale variance dominates in-the-wild error. Train a 55-landmark
+regressor on iBUG Collection A, then produce an aligned copy of any corpus:
+
+```bash
+earid align-train \
+  --source .cache/datasets/ibug-a/CollectionA \
+  --output-dir runs/earid-align
+
+earid align-run \
+  --checkpoint runs/earid-align/landmarks.pt \
+  --source .cache/datasets/identity-v2 \
+  --output .cache/datasets/identity-v2-aligned
+```
+
+Alignment rotates each ear so the lobe-to-helix axis points up and tightly
+crops around the landmarks. Images with iBUG-style `.pts` sidecar files use
+the ground-truth annotations: 55-point files are aligned directly, and
+4-point bounding boxes (Collection B) are cropped before landmark
+alignment — important because Collection B images are full-face photos.
+
 ## Train repeated runs
 
 ```bash
