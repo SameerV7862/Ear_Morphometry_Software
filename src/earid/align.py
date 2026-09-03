@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -32,11 +33,13 @@ _NORMALIZE = transforms.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224,
 
 
 def parse_pts(path: Path) -> np.ndarray:
+    """Parse an iBUG .pts file (55 landmarks in Collection A, 4-point bboxes in B)."""
     lines = path.read_text().splitlines()
+    n_points = int(next(line.split(":")[1] for line in lines if line.startswith("n_points")))
     start = lines.index("{") + 1
-    points = [tuple(float(v) for v in line.split()) for line in lines[start : start + NUM_LANDMARKS]]
-    if len(points) != NUM_LANDMARKS:
-        raise ValueError(f"{path} has {len(points)} points, expected {NUM_LANDMARKS}")
+    points = [tuple(float(v) for v in line.split()) for line in lines[start : start + n_points]]
+    if len(points) != n_points:
+        raise ValueError(f"{path} has {len(points)} points, expected {n_points}")
     return np.asarray(points, dtype=np.float32)
 
 
@@ -223,6 +226,23 @@ def predict_landmarks(model: nn.Module, image: Image.Image, image_size: int, dev
     return normalized * np.array([image.width, image.height], dtype=np.float32)
 
 
+def _align_from_points(
+    image: Image.Image,
+    points: np.ndarray,
+    margin: float,
+    output_size: int,
+) -> Image.Image:
+    lobe = points[LOBE_POINTS].mean(axis=0)
+    helix_top = points[ASCENDING_HELIX_POINTS].mean(axis=0)
+    axis = helix_top - lobe
+    angle = math.degrees(math.atan2(axis[0], -axis[1]))  # 0 when axis points straight up
+    rotated, rotated_points = _rotate(image, points, -angle)
+    cropped, _ = _crop_around_landmarks(rotated, rotated_points, margin, jitter=0.0)
+    if cropped.width < 8 or cropped.height < 8:
+        cropped = image  # fall back to the original crop on degenerate predictions
+    return cropped.resize((output_size, output_size), Image.BILINEAR)
+
+
 def align_image(
     model: nn.Module,
     image: Image.Image,
@@ -233,15 +253,7 @@ def align_image(
 ) -> Image.Image:
     """Rotate so the lobe-to-helix axis points up, then tightly crop."""
     points = predict_landmarks(model, image, image_size, device)
-    lobe = points[LOBE_POINTS].mean(axis=0)
-    helix_top = points[ASCENDING_HELIX_POINTS].mean(axis=0)
-    axis = helix_top - lobe
-    angle = math.degrees(math.atan2(axis[0], -axis[1]))  # 0 when axis points straight up
-    rotated, rotated_points = _rotate(image, points, -angle)
-    cropped, _ = _crop_around_landmarks(rotated, rotated_points, margin, jitter=0.0)
-    if cropped.width < 8 or cropped.height < 8:
-        cropped = image  # fall back to the original crop on degenerate predictions
-    return cropped.resize((output_size, output_size), Image.BILINEAR)
+    return _align_from_points(image, points, margin, output_size)
 
 
 def align_corpus(
@@ -254,13 +266,32 @@ def align_corpus(
     device = torch.device(device_name)
     model, image_size = load_landmark_model(checkpoint_path, device)
     written = failed = 0
-    files = [p for p in sorted(source_root.rglob("*")) if p.suffix.lower() in IMAGE_EXTENSIONS and p.is_file()]
+    files = []
+    # os.walk with followlinks so symlinked dataset roots are traversed
+    for dirpath, _, names in os.walk(source_root, followlinks=True):
+        for name in sorted(names):
+            path = Path(dirpath) / name
+            if path.suffix.lower() in IMAGE_EXTENSIONS:
+                files.append(path)
+    files.sort()
     for path in tqdm(files):
         target = output_root / path.relative_to(source_root).with_suffix(".jpg")
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             with Image.open(path) as img:
-                aligned = align_image(model, img.convert("RGB"), image_size, device, output_size=output_size)
+                img = img.convert("RGB")
+                pts_path = path.with_suffix(".pts")
+                if pts_path.exists():
+                    points = parse_pts(pts_path)
+                    if len(points) == NUM_LANDMARKS:
+                        aligned = _align_from_points(img, points, margin=0.22, output_size=output_size)
+                    else:
+                        # Bounding-box annotation (Collection B): crop the true ear
+                        # region first, then landmark-align the crop.
+                        img, _ = _crop_around_landmarks(img, points, margin=0.35, jitter=0.0)
+                        aligned = align_image(model, img, image_size, device, output_size=output_size)
+                else:
+                    aligned = align_image(model, img, image_size, device, output_size=output_size)
             aligned.save(target, "JPEG", quality=95)
             written += 1
         except Exception:  # noqa: BLE001 - skip unreadable files, keep aligning
