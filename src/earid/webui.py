@@ -236,7 +236,12 @@ document.getElementById('candImage').addEventListener('touchend', e => {
 def _load_checkpoint(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     backbone = checkpoint["config"]["backbone"]
-    model = build_model(backbone, num_classes=len(checkpoint["label_to_index"]), pretrained=False)
+    model = build_model(
+        backbone,
+        num_classes=len(checkpoint["label_to_index"]),
+        pretrained=False,
+        loss=checkpoint["config"].get("loss", "ce"),
+    )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
