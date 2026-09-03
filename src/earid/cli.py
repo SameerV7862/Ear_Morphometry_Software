@@ -130,6 +130,9 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument("--port", type=int, default=7860)
     ui_parser.add_argument("--device", default="cpu")
     ui_parser.add_argument("--batch-size", type=int, default=16)
+    ui_parser.add_argument(
+        "--align-checkpoint", help="Optional landmarks.pt for automatic ear alignment of uploads"
+    )
 
     align_train_parser = subparsers.add_parser(
         "align-train", help="Train the 55-landmark ear alignment model on iBUG Collection A"
@@ -255,7 +258,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "ui":
         from .webui import create_app
 
-        app = create_app(Path(args.checkpoint), args.device, args.batch_size)
+        app = create_app(
+            Path(args.checkpoint),
+            args.device,
+            args.batch_size,
+            align_checkpoint=Path(args.align_checkpoint) if args.align_checkpoint else None,
+        )
         print(json.dumps({"url": f"http://{args.host}:{args.port}", "checkpoint": args.checkpoint}))
         app.run(host=args.host, port=args.port)
         return

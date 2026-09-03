@@ -259,11 +259,25 @@ def _build_transform(image_size: int):
     )
 
 
-def create_app(checkpoint_path: Path, device_name: str = "cpu", batch_size: int = 16) -> Flask:
+def create_app(
+    checkpoint_path: Path,
+    device_name: str = "cpu",
+    batch_size: int = 16,
+    align_checkpoint: Path | None = None,
+) -> Flask:
     device = torch.device(device_name)
     model, backbone, image_size = _load_checkpoint(checkpoint_path, device)
     transform = _build_transform(image_size)
     run_name = checkpoint_path.parent.name
+
+    aligner = None
+    if align_checkpoint is not None:
+        from .align import align_image, load_landmark_model
+
+        landmark_model, landmark_size = load_landmark_model(align_checkpoint, device)
+
+        def aligner(image: Image.Image) -> Image.Image:
+            return align_image(landmark_model, image, landmark_size, device, output_size=image_size)
 
     app = Flask(__name__)
     app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
@@ -293,7 +307,10 @@ def create_app(checkpoint_path: Path, device_name: str = "cpu", batch_size: int 
 
         def to_tensor(storage) -> torch.Tensor:
             with Image.open(io.BytesIO(storage.read())) as image:
-                return transform(ImageOps.exif_transpose(image).convert("RGB"))
+                image = ImageOps.exif_transpose(image).convert("RGB")
+                if aligner is not None:
+                    image = aligner(image)
+                return transform(image)
 
         try:
             reference_tensor = to_tensor(reference)
@@ -315,6 +332,8 @@ def create_app(checkpoint_path: Path, device_name: str = "cpu", batch_size: int 
         if upload is None:
             return jsonify({"error": "Provide an image"}), 400
         try:
+            # Previews always show the user's original photo; alignment is
+            # applied only in the backend embedding path.
             with Image.open(io.BytesIO(upload.read())) as image:
                 image = ImageOps.exif_transpose(image).convert("RGB")
                 image.thumbnail((1280, 1280))
@@ -334,9 +353,15 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--align-checkpoint", help="Optional landmarks.pt for automatic ear alignment of uploads")
     args = parser.parse_args(argv)
 
-    app = create_app(Path(args.checkpoint), args.device, args.batch_size)
+    app = create_app(
+        Path(args.checkpoint),
+        args.device,
+        args.batch_size,
+        align_checkpoint=Path(args.align_checkpoint) if args.align_checkpoint else None,
+    )
     print(json.dumps({"url": f"http://{args.host}:{args.port}", "checkpoint": args.checkpoint}))
     app.run(host=args.host, port=args.port)
 
