@@ -26,7 +26,7 @@ from .data import (
     split_samples,
 )
 from .metrics import classification_metrics
-from .models import build_model, load_matching_state_dict
+from .models import ArcFaceModel, build_model, load_matching_state_dict
 
 
 @dataclass
@@ -50,6 +50,7 @@ class TrainConfig:
     device: str
     init_checkpoint: str | None = None
     max_samples_per_identity: int | None = None
+    loss: str = "ce"
 
 
 @dataclass
@@ -119,7 +120,10 @@ def run_epoch(
 
         with torch.set_grad_enabled(training):
             with torch.cuda.amp.autocast(enabled=scaler is not None):
-                logits = model(images)
+                if training and isinstance(model, ArcFaceModel):
+                    logits = model(images, targets)
+                else:
+                    logits = model(images)
                 loss = criterion(logits, targets)
 
             if training:
@@ -228,7 +232,9 @@ def train_single_run(config: TrainConfig) -> dict[str, float]:
     test_loader = DataLoader(test_ds, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers, pin_memory=torch.cuda.is_available())
 
     device = torch.device(config.device)
-    model = build_model(config.backbone, num_classes=len(label_to_index), pretrained=config.pretrained).to(device)
+    model = build_model(
+        config.backbone, num_classes=len(label_to_index), pretrained=config.pretrained, loss=config.loss
+    ).to(device)
     init_info = load_initial_weights(model, config.init_checkpoint)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)

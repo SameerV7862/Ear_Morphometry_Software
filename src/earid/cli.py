@@ -36,6 +36,7 @@ def _common_train_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--backbone", default="resnet18", choices=["resnet18", "efficientnet_b0", "paper_cnn"])
+    parser.add_argument("--loss", default="ce", choices=["ce", "arcface"], help="Classification loss")
     parser.add_argument("--pretrained", action="store_true", help="Use ImageNet pretrained weights")
     parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--num-workers", type=int, default=2)
@@ -129,6 +130,29 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument("--port", type=int, default=7860)
     ui_parser.add_argument("--device", default="cpu")
     ui_parser.add_argument("--batch-size", type=int, default=16)
+
+    align_train_parser = subparsers.add_parser(
+        "align-train", help="Train the 55-landmark ear alignment model on iBUG Collection A"
+    )
+    align_train_parser.add_argument("--source", required=True, help="CollectionA root with train/ and test/")
+    align_train_parser.add_argument("--output-dir", default="runs/earid-align")
+    align_train_parser.add_argument("--image-size", type=int, default=128)
+    align_train_parser.add_argument("--batch-size", type=int, default=32)
+    align_train_parser.add_argument("--epochs", type=int, default=40)
+    align_train_parser.add_argument("--lr", type=float, default=3e-4)
+    align_train_parser.add_argument("--patience", type=int, default=8)
+    align_train_parser.add_argument("--num-workers", type=int, default=0)
+    align_train_parser.add_argument("--device", default="cpu")
+    align_train_parser.add_argument("--seed", type=int, default=42)
+
+    align_run_parser = subparsers.add_parser(
+        "align-run", help="Produce an aligned copy of an image corpus using a trained landmark model"
+    )
+    align_run_parser.add_argument("--checkpoint", required=True, help="landmarks.pt from align-train")
+    align_run_parser.add_argument("--source", required=True, help="Corpus root to align")
+    align_run_parser.add_argument("--output", required=True, help="Destination root for aligned images")
+    align_run_parser.add_argument("--output-size", type=int, default=224)
+    align_run_parser.add_argument("--device", default="cpu")
 
     return parser
 
@@ -236,6 +260,39 @@ def main(argv: list[str] | None = None) -> None:
         app.run(host=args.host, port=args.port)
         return
 
+    if args.command == "align-train":
+        from .align import AlignTrainConfig, train_landmarks
+
+        metrics = train_landmarks(
+            AlignTrainConfig(
+                source=args.source,
+                output_dir=args.output_dir,
+                image_size=args.image_size,
+                batch_size=args.batch_size,
+                epochs=args.epochs,
+                lr=args.lr,
+                patience=args.patience,
+                num_workers=args.num_workers,
+                device=args.device,
+                seed=args.seed,
+            )
+        )
+        print(json.dumps(metrics, indent=2))
+        return
+
+    if args.command == "align-run":
+        from .align import align_corpus
+
+        stats = align_corpus(
+            Path(args.checkpoint),
+            Path(args.source),
+            Path(args.output),
+            device_name=args.device,
+            output_size=args.output_size,
+        )
+        print(json.dumps(stats, indent=2))
+        return
+
     if args.command == "prepare":
         root = prepare_dataset(Path(args.source), Path(args.cache_dir))
         samples = discover_samples(root, include_full_face=args.include_full_face)
@@ -266,6 +323,7 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=args.num_workers,
                 device=args.device,
                 max_samples_per_identity=args.max_samples_per_identity,
+                loss=args.loss,
             )
         )
         print(json.dumps(metrics, indent=2))
@@ -293,6 +351,7 @@ def main(argv: list[str] | None = None) -> None:
                 device=args.device,
                 init_checkpoint=args.init_checkpoint,
                 max_samples_per_identity=args.max_samples_per_identity,
+                loss=args.loss,
             )
         )
         print(json.dumps(metrics, indent=2))
@@ -319,6 +378,7 @@ def main(argv: list[str] | None = None) -> None:
                 num_workers=args.num_workers,
                 device=args.device,
                 max_samples_per_identity=args.max_samples_per_identity,
+                loss=args.loss,
             ),
             runs=args.mc_runs,
             seed_step=args.mc_seed_step,
@@ -356,7 +416,7 @@ def main(argv: list[str] | None = None) -> None:
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         test_loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
         device = torch.device(args.device)
-        model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False).to(device)
+        model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False, loss=checkpoint["config"].get("loss", "ce")).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
 
@@ -449,7 +509,7 @@ def main(argv: list[str] | None = None) -> None:
             raise ValueError("--temperature must be greater than zero")
         checkpoint = torch.load(args.checkpoint, map_location=args.device)
         device = torch.device(args.device)
-        model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False).to(device)
+        model = build_model(checkpoint["config"]["backbone"], num_classes=len(checkpoint["label_to_index"]), pretrained=False, loss=checkpoint["config"].get("loss", "ce")).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
         inv_labels = {idx: label for label, idx in checkpoint["label_to_index"].items()}
@@ -534,6 +594,7 @@ def main(argv: list[str] | None = None) -> None:
             backbone,
             num_classes=len(checkpoint["label_to_index"]),
             pretrained=False,
+            loss=checkpoint_config.get("loss", "ce"),
         ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
@@ -680,7 +741,12 @@ def main(argv: list[str] | None = None) -> None:
 
         device = torch.device(args.device)
         backbone = checkpoint["config"]["backbone"]
-        model = build_model(backbone, num_classes=len(checkpoint["label_to_index"]), pretrained=False).to(device)
+        model = build_model(
+            backbone,
+            num_classes=len(checkpoint["label_to_index"]),
+            pretrained=False,
+            loss=checkpoint["config"].get("loss", "ce"),
+        ).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
         model.eval()
 
