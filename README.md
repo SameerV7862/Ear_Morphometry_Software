@@ -5,7 +5,7 @@ ear — a biometric that stays exposed when faces are masked — trained at a
 scale beyond prior academic ear-recognition studies and evaluated with
 forensic-grade rigor.
 
-Created by Sameer Varkantham --- Sophmore at GWU
+Created by Sameer Varkantham --- Sophomore at GWU
 
 ## Headline results
 
