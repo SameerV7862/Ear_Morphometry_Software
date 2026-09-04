@@ -6,6 +6,32 @@ Ear-based human identification pipeline with a reproducible PyTorch training sta
 
 This project is informed by the ear-recognition literature, especially the six-layer CNN approach described in [PMC7594944](https://pmc.ncbi.nlm.nih.gov/articles/PMC7594944/), which reported strong recognition rates on IITD-II and AMI ear datasets. The dataset inventory and dataset links are organized using the ear-dataset index maintained by [IAPR TC4](https://iapr-tc4.org/ear-datasets/).
 
+## Scale and forensic utility
+
+Most published ear-recognition studies train on a single controlled-capture
+dataset of a few hundred images (AMI: 700 images / ~100 subjects; IITD-II:
+~800 images / 221 subjects). This model trains on a merged corpus of
+**31,262 images across 510 subjects** drawn from four sources (AMI, EarVN1.0,
+iBUG Collection B, and an in-house adult corpus) — over an order of magnitude
+more images than the classic benchmarks, spanning studio captures and
+unconstrained in-the-wild photos.
+
+Crucially, the corpus includes age-progressed imagery: iBUG Collection B
+consists of celebrity photos collected across many years of each subject's
+life, with significant aging, pose, lighting, occlusion, and resolution
+variation. Training on the same ears photographed years apart teaches the
+model age-invariant ear structure rather than a single moment in time. This
+matters forensically, because case photos and reference photos are rarely
+contemporaneous.
+
+The larger and more diverse subject pool (multiple continents, capture
+conditions, and age ranges) improves generalizability to subjects the model
+has never seen, which is the regime that matters for investigative
+candidate-ranking. Cross-dataset and cohort audits are built into the
+evaluation commands below so these claims stay measurable.
+
+## Dataset licenses
+
 EarVN1.0 is available from [Mendeley Data](https://doi.org/10.17632/yws3v3mwx3.4)
 under CC BY-NC 3.0. It contains 28,412 unconstrained images from 164 people.
 Commercial model training or redistribution is prohibited by its license and
@@ -61,6 +87,34 @@ earid train \
 The optional per-identity cap is deterministic for the configured seed. It is
 useful for large, imbalanced datasets such as EarVN1.0 and is saved in the
 checkpoint configuration and manifest.
+
+Pass `--loss arcface` to train with an additive angular margin (ArcFace)
+head instead of plain cross-entropy. This directly optimizes the embedding
+space used for ranking and open-set matching. Checkpoints record the loss
+type, so evaluation, prediction, cross-testing, and the UI all reload the
+right architecture automatically.
+
+## Ear alignment
+
+Pose and scale variance dominates in-the-wild error. Train a 55-landmark
+regressor on iBUG Collection A, then produce an aligned copy of any corpus:
+
+```bash
+earid align-train \
+  --source .cache/datasets/ibug-a/CollectionA \
+  --output-dir runs/earid-align
+
+earid align-run \
+  --checkpoint runs/earid-align/landmarks.pt \
+  --source .cache/datasets/identity-v2 \
+  --output .cache/datasets/identity-v2-aligned
+```
+
+Alignment rotates each ear so the lobe-to-helix axis points up and tightly
+crops around the landmarks. Images with iBUG-style `.pts` sidecar files use
+the ground-truth annotations: 55-point files are aligned directly, and
+4-point bounding boxes (Collection B) are cropped before landmark
+alignment — important because Collection B images are full-face photos.
 
 ## Train repeated runs
 
@@ -139,6 +193,17 @@ earid cross-test \
 This gallery/probe test uses one image per identity as the gallery and all
 remaining images as probes. Run it before training on a new dataset to preserve
 an uncontaminated domain-transfer baseline.
+
+## Comparison UI
+
+```bash
+earid ui --checkpoint runs/earid/checkpoint.pt --port 7860
+```
+
+Opens a local web app: upload one reference ear photo on the left, drop
+hundreds of candidate photos on the right, and swipe through them ranked by
+embedding cosine similarity (arrow keys, swipe, or the thumbnail strip).
+Scores are investigative-lead indicators, not identity conclusions.
 
 ## Notes
 
