@@ -16,6 +16,12 @@ dependencies = [
   "tqdm>=4.66",
 ]
 
+[project.optional-dependencies]
+ui = [
+  "flask>=3.0",
+  "pillow-heif>=0.16",
+]
+
 [project.scripts]
 earid = "earid.cli:main"
 
