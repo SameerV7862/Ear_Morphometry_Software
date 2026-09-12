@@ -87,8 +87,7 @@ dataset links are organized via the index maintained by
 
 EarVN1.0 is available from [Mendeley Data](https://doi.org/10.17632/yws3v3mwx3.4)
 under CC BY-NC 3.0. It contains 28,412 unconstrained images from 164 people.
-Commercial model training or redistribution is prohibited by its license and
-dataset terms.
+
 
 [iBUG Ears Collection B](https://ibug.doc.ic.ac.uk/resources/ibug-ears/)
 contains 2,058 identity-labelled images from 231 people. It is available for
