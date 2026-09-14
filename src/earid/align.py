@@ -207,6 +207,227 @@ def train_landmarks(config: AlignTrainConfig) -> dict[str, float]:
     return best_metrics
 
 
+@dataclass
+class DetectTrainConfig:
+    source: str  # iBUG Collection B root (identity dirs with 4-pt bbox .pts)
+    output_dir: str
+    ear_source: str = ""  # optional Collection A root (ear-only crops with 55-pt .pts)
+    image_size: int = 224
+    batch_size: int = 32
+    epochs: int = 30
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    patience: int = 6
+    num_workers: int = 0
+    device: str = "cpu"
+    seed: int = 42
+    val_ratio: float = 0.1
+
+
+def _collect_annotated(root: Path) -> list[Path]:
+    files = []
+    for dirpath, _, names in os.walk(root, followlinks=True):
+        for name in sorted(names):
+            path = Path(dirpath) / name
+            if path.suffix.lower() in IMAGE_EXTENSIONS and path.with_suffix(".pts").exists():
+                files.append(path)
+    return sorted(files)
+
+
+class DetectorDataset(Dataset):
+    """Ear bounding-box regression on full-context photos and ear-only crops.
+
+    Collection B samples teach "find the ear in a face photo"; Collection A
+    ear-only samples (bbox covering most of the crop) teach "this already is
+    an ear", so one detector handles both input regimes at inference.
+    """
+
+    def __init__(self, samples: list[tuple[Path, str]], image_size: int, train: bool) -> None:
+        if not samples:
+            raise ValueError("No annotated detector samples found")
+        self.samples = samples
+        self.image_size = image_size
+        self.train = train
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, index: int):
+        path, kind = self.samples[index]
+        image = Image.open(path).convert("RGB")
+        points = parse_pts(path.with_suffix(".pts")).copy()
+
+        if kind == "ear_only":
+            margin = random.uniform(0.05, 0.50) if self.train else 0.25
+            image, points = _crop_around_landmarks(image, points, margin, jitter=0.0)
+        elif self.train and random.random() < 0.5:
+            # Random context crop that still contains the ear bbox.
+            margin = random.uniform(0.3, 4.0)
+            image, points = _crop_around_landmarks(image, points, margin, jitter=0.15)
+
+        if self.train and random.random() < 0.5:
+            image = image.transpose(Image.FLIP_LEFT_RIGHT)
+            points[:, 0] = image.width - 1 - points[:, 0]
+
+        min_xy = points.min(axis=0)
+        max_xy = points.max(axis=0)
+        scale = np.array([image.width, image.height], dtype=np.float32)
+        target = np.concatenate([min_xy / scale, max_xy / scale]).clip(0.0, 1.0)
+        tensor = _NORMALIZE(
+            transforms.functional.to_tensor(image.resize((self.image_size, self.image_size), Image.BILINEAR))
+        )
+        return tensor, torch.from_numpy(target.astype(np.float32))
+
+
+def build_detector_model(pretrained: bool = True) -> nn.Module:
+    weights = models.ResNet18_Weights.DEFAULT if pretrained else None
+    model = models.resnet18(weights=weights)
+    model.fc = nn.Sequential(nn.Linear(model.fc.in_features, 4), nn.Sigmoid())
+    return model
+
+
+def _mean_iou(pred: torch.Tensor, target: torch.Tensor) -> float:
+    lt = torch.max(pred[:, :2], target[:, :2])
+    rb = torch.min(pred[:, 2:], target[:, 2:])
+    inter = (rb - lt).clamp(min=0).prod(dim=1)
+    area_p = (pred[:, 2:] - pred[:, :2]).clamp(min=0).prod(dim=1)
+    area_t = (target[:, 2:] - target[:, :2]).clamp(min=0).prod(dim=1)
+    return (inter / (area_p + area_t - inter).clamp(min=1e-6)).mean().item()
+
+
+def train_detector(config: DetectTrainConfig) -> dict[str, float]:
+    torch.manual_seed(config.seed)
+    random.seed(config.seed)
+    np.random.seed(config.seed)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    device = torch.device(config.device)
+
+    context_files = _collect_annotated(Path(config.source))
+    # Subject-safe split: hold out whole identity directories for validation.
+    identities = sorted({p.parent for p in context_files})
+    rng = random.Random(config.seed)
+    rng.shuffle(identities)
+    n_val = max(1, int(len(identities) * config.val_ratio))
+    val_dirs = set(identities[:n_val])
+    train_samples = [(p, "context") for p in context_files if p.parent not in val_dirs]
+    val_samples = [(p, "context") for p in context_files if p.parent in val_dirs]
+
+    if config.ear_source:
+        ear_root = Path(config.ear_source)
+        if (ear_root / "train").exists():
+            train_samples += [(p, "ear_only") for p in _collect_annotated(ear_root / "train")]
+            val_samples += [(p, "ear_only") for p in _collect_annotated(ear_root / "test")]
+        else:
+            train_samples += [(p, "ear_only") for p in _collect_annotated(ear_root)]
+
+    train_loader = DataLoader(
+        DetectorDataset(train_samples, config.image_size, train=True),
+        batch_size=config.batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+    )
+    val_loader = DataLoader(
+        DetectorDataset(val_samples, config.image_size, train=False),
+        batch_size=config.batch_size,
+        shuffle=False,
+        num_workers=config.num_workers,
+    )
+
+    model = build_detector_model(pretrained=True).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=3)
+    criterion = nn.SmoothL1Loss(beta=0.02)
+
+    best_iou = -math.inf
+    best_metrics: dict[str, float] = {}
+    bad_epochs = 0
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        train_losses = []
+        for images, targets in tqdm(train_loader, leave=False):
+            images, targets = images.to(device), targets.to(device)
+            loss = criterion(model(images), targets)
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        ious, val_losses = [], []
+        with torch.no_grad():
+            for images, targets in val_loader:
+                images, targets = images.to(device), targets.to(device)
+                preds = model(images)
+                val_losses.append(criterion(preds, targets).item())
+                ious.append(_mean_iou(preds, targets))
+        val_iou = float(np.mean(ious))
+        scheduler.step(val_iou)
+        print(
+            json.dumps(
+                {
+                    "epoch": epoch,
+                    "train_loss": float(np.mean(train_losses)),
+                    "val_loss": float(np.mean(val_losses)),
+                    "val_iou": val_iou,
+                }
+            ),
+            flush=True,
+        )
+        if val_iou > best_iou:
+            best_iou = val_iou
+            best_metrics = {"epoch": float(epoch), "val_iou": val_iou}
+            bad_epochs = 0
+            torch.save(
+                {"model_state_dict": model.state_dict(), "config": asdict(config), "best_metrics": best_metrics},
+                output_dir / "detector.pt",
+            )
+        else:
+            bad_epochs += 1
+            if bad_epochs >= config.patience:
+                break
+    (output_dir / "metrics.json").write_text(json.dumps(best_metrics, indent=2), encoding="utf-8")
+    return best_metrics
+
+
+def load_detector(checkpoint_path: Path, device: torch.device):
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    model = build_detector_model(pretrained=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(device)
+    model.eval()
+    image_size = int(checkpoint["config"].get("image_size", 224))
+    return model, image_size
+
+
+def predict_ear_bbox(model: nn.Module, image: Image.Image, image_size: int, device: torch.device) -> np.ndarray:
+    tensor = _NORMALIZE(
+        transforms.functional.to_tensor(image.resize((image_size, image_size), Image.BILINEAR))
+    ).unsqueeze(0)
+    with torch.no_grad():
+        normalized = model(tensor.to(device)).cpu().numpy().reshape(4)
+    scale = np.array([image.width, image.height, image.width, image.height], dtype=np.float32)
+    return normalized * scale
+
+
+def detect_and_align(
+    detector: nn.Module,
+    detector_size: int,
+    landmark_model: nn.Module,
+    landmark_size: int,
+    image: Image.Image,
+    device: torch.device,
+    margin: float = 0.35,
+    output_size: int = 224,
+) -> Image.Image:
+    """Locate the ear in any photo (face context or ear-only), crop, then align."""
+    bbox = predict_ear_bbox(detector, image, detector_size, device)
+    corners = np.array([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], dtype=np.float32)
+    if (corners[1] - corners[0]).min() >= 4:
+        image, _ = _crop_around_landmarks(image, corners, margin, jitter=0.0)
+    return align_image(landmark_model, image, landmark_size, device, output_size=output_size)
+
+
 def load_landmark_model(checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model = build_landmark_model(pretrained=False)
