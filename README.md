@@ -167,6 +167,30 @@ the ground-truth annotations: 55-point files are aligned directly, and
 4-point bounding boxes (Collection B) are cropped before landmark
 alignment — important because Collection B images are full-face photos.
 
+## Ear detection (full-context photos)
+
+Training happens on ear-only crops, but the deployed system accepts any
+photo. A bounding-box detector trained on iBUG Collection B full-face
+photos (plus Collection A ear-only crops, so it also recognizes "this
+already is an ear") locates the ear before alignment:
+
+```bash
+earid detect-train \
+  --source .cache/datasets/ibug/CollectionB \
+  --ear-source .cache/datasets/ibug-a/CollectionA \
+  --output-dir runs/earid-detect
+```
+
+Pass both stages to the UI and every upload — face context or not — is
+automatically cropped to the ear and aligned before embedding:
+
+```bash
+earid ui --checkpoint runs/earid/checkpoint.pt \
+  --align-checkpoint runs/earid-align/landmarks.pt \
+  --detect-checkpoint runs/earid-detect/detector.pt
+```
+
+
 ## Train repeated runs
 
 ```bash

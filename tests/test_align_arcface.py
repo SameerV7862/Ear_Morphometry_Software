@@ -76,3 +76,63 @@ def test_arcface_warm_start_from_plain_checkpoint():
     missing, _ = load_matching_state_dict(arc, plain.state_dict())
     # every backbone tensor should transfer; only the arc weight stays missing
     assert missing == ["weight"]
+
+
+def test_detector_model_output_shape():
+    from earid.align import build_detector_model
+
+    model = build_detector_model(pretrained=False)
+    out = model(torch.randn(2, 3, 224, 224))
+    assert out.shape == (2, 4)
+    assert out.min() >= 0 and out.max() <= 1
+
+
+def test_predict_ear_bbox_scales_to_image():
+    from PIL import Image
+
+    from earid.align import build_detector_model, predict_ear_bbox
+
+    model = build_detector_model(pretrained=False).eval()
+    image = Image.new("RGB", (640, 480))
+    bbox = predict_ear_bbox(model, image, 224, torch.device("cpu"))
+    assert bbox.shape == (4,)
+    assert 0 <= bbox[0] <= 640 and 0 <= bbox[1] <= 480
+    assert 0 <= bbox[2] <= 640 and 0 <= bbox[3] <= 480
+
+
+def test_detect_and_align_returns_output_size():
+    from PIL import Image
+
+    from earid.align import build_detector_model, build_landmark_model, detect_and_align
+
+    detector = build_detector_model(pretrained=False).eval()
+    landmarks = build_landmark_model(pretrained=False).eval()
+    image = Image.new("RGB", (400, 300), (128, 100, 90))
+    out = detect_and_align(detector, 224, landmarks, 128, image, torch.device("cpu"), output_size=224)
+    assert out.size == (224, 224)
+
+
+def test_detector_dataset_mixed_kinds(tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    from earid.align import DetectorDataset
+
+    samples = []
+    for i, kind in enumerate(["context", "ear_only"]):
+        img_path = tmp_path / f"s{i}.png"
+        Image.new("RGB", (200, 160), (90, 90, 90)).save(img_path)
+        n = 4 if kind == "context" else 55
+        rng = np.random.default_rng(i)
+        pts = rng.uniform([40, 30], [150, 130], size=(n, 2))
+        lines = [f"version: 1", f"n_points: {n}", "{"] + [f"{x:.2f} {y:.2f}" for x, y in pts] + ["}"]
+        img_path.with_suffix(".pts").write_text("\n".join(lines))
+        samples.append((img_path, kind))
+
+    for train in (True, False):
+        ds = DetectorDataset(samples, image_size=224, train=train)
+        for tensor, target in [ds[0], ds[1]]:
+            assert tensor.shape == (3, 224, 224)
+            assert target.shape == (4,)
+            assert (target >= 0).all() and (target <= 1).all()
+            assert target[0] <= target[2] and target[1] <= target[3]

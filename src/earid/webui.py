@@ -264,6 +264,7 @@ def create_app(
     device_name: str = "cpu",
     batch_size: int = 16,
     align_checkpoint: Path | None = None,
+    detect_checkpoint: Path | None = None,
 ) -> Flask:
     device = torch.device(device_name)
     model, backbone, image_size = _load_checkpoint(checkpoint_path, device)
@@ -272,11 +273,19 @@ def create_app(
 
     aligner = None
     if align_checkpoint is not None:
-        from .align import align_image, load_landmark_model
+        from .align import align_image, detect_and_align, load_detector, load_landmark_model
 
         landmark_model, landmark_size = load_landmark_model(align_checkpoint, device)
+        detector = detector_size = None
+        if detect_checkpoint is not None:
+            detector, detector_size = load_detector(detect_checkpoint, device)
 
         def aligner(image: Image.Image) -> Image.Image:
+            if detector is not None:
+                # Locate the ear first so full-context photos work too.
+                return detect_and_align(
+                    detector, detector_size, landmark_model, landmark_size, image, device, output_size=image_size
+                )
             return align_image(landmark_model, image, landmark_size, device, output_size=image_size)
 
     app = Flask(__name__)
@@ -354,6 +363,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--align-checkpoint", help="Optional landmarks.pt for automatic ear alignment of uploads")
+    parser.add_argument("--detect-checkpoint", help="Optional detector.pt to locate ears in full-context photos")
     args = parser.parse_args(argv)
 
     app = create_app(
@@ -361,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
         args.device,
         args.batch_size,
         align_checkpoint=Path(args.align_checkpoint) if args.align_checkpoint else None,
+        detect_checkpoint=Path(args.detect_checkpoint) if args.detect_checkpoint else None,
     )
     print(json.dumps({"url": f"http://{args.host}:{args.port}", "checkpoint": args.checkpoint}))
     app.run(host=args.host, port=args.port)
