@@ -71,6 +71,11 @@ The included web UI (`earid ui`) accepts one reference photo and hundreds of
 candidate photos, then presents candidates ranked by embedding similarity —
 an investigative-lead tool, with scores framed as leads, not conclusions.
 
+Every uploaded photo is given a **suitability score** (0–100) explaining how
+fit it is for comparison, broken down into ear detectability, ear-region
+resolution, sharpness, and exposure — so low-quality inputs are flagged
+before their similarity scores are over-interpreted.
+
 ---
 
 ## About this repository
