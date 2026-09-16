@@ -51,6 +51,21 @@ The larger and more diverse subject pool (multiple continents, capture
 conditions, and age ranges) improves generalizability to subjects the model
 has never seen — the regime that matters for investigative candidate-ranking.
 
+### Missing-persons cases
+
+Outer-ear morphometry is especially valuable for missing-persons work
+because the pinna's cartilage structure — the helix, antihelix, concha, and
+tragus geometry — stays remarkably consistent through aging. Unlike facial
+geometry, which shifts substantially with soft-tissue changes, weight,
+and age (a particular problem for children who go missing and are found
+years later), the ear's identifying structure is largely fixed after early
+childhood; only the lobe elongates gradually. A years-old reference photo
+can therefore still be matched against a current photo of the person. The
+age-progressed training corpus described above directly targets this
+scenario: the model learns to match the same ear across years of aging,
+making it a practical screening tool for long-gap identifications where
+face-based systems degrade.
+
 ## Forensic-grade evaluation, not just accuracy
 
 - **Subject-safe splits**: no identity's capture session appears in both
@@ -72,6 +87,11 @@ has never seen — the regime that matters for investigative candidate-ranking.
 The included web UI (`earid ui`) accepts one reference photo and hundreds of
 candidate photos, then presents candidates ranked by embedding similarity —
 an investigative-lead tool, with scores framed as leads, not conclusions.
+
+Every uploaded photo is given a **suitability score** (0–100) explaining how
+fit it is for comparison, broken down into ear detectability, ear-region
+resolution, sharpness, and exposure — so low-quality inputs are flagged
+before their similarity scores are over-interpreted.
 
 ---
 
@@ -167,6 +187,30 @@ crops around the landmarks. Images with iBUG-style `.pts` sidecar files use
 the ground-truth annotations: 55-point files are aligned directly, and
 4-point bounding boxes (Collection B) are cropped before landmark
 alignment — important because Collection B images are full-face photos.
+
+## Ear detection (full-context photos)
+
+Training happens on ear-only crops, but the deployed system accepts any
+photo. A bounding-box detector trained on iBUG Collection B full-face
+photos (plus Collection A ear-only crops, so it also recognizes "this
+already is an ear") locates the ear before alignment:
+
+```bash
+earid detect-train \
+  --source .cache/datasets/ibug/CollectionB \
+  --ear-source .cache/datasets/ibug-a/CollectionA \
+  --output-dir runs/earid-detect
+```
+
+Pass both stages to the UI and every upload — face context or not — is
+automatically cropped to the ear and aligned before embedding:
+
+```bash
+earid ui --checkpoint runs/earid/checkpoint.pt \
+  --align-checkpoint runs/earid-align/landmarks.pt \
+  --detect-checkpoint runs/earid-detect/detector.pt
+```
+
 
 ## Train repeated runs
 

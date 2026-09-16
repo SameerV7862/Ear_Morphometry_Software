@@ -133,6 +133,10 @@ def build_parser() -> argparse.ArgumentParser:
     ui_parser.add_argument(
         "--align-checkpoint", help="Optional landmarks.pt for automatic ear alignment of uploads"
     )
+    ui_parser.add_argument(
+        "--detect-checkpoint",
+        help="Optional detector.pt to locate the ear in full-context photos before alignment",
+    )
 
     align_train_parser = subparsers.add_parser(
         "align-train", help="Train the 55-landmark ear alignment model on iBUG Collection A"
@@ -147,6 +151,21 @@ def build_parser() -> argparse.ArgumentParser:
     align_train_parser.add_argument("--num-workers", type=int, default=0)
     align_train_parser.add_argument("--device", default="cpu")
     align_train_parser.add_argument("--seed", type=int, default=42)
+
+    detect_train_parser = subparsers.add_parser(
+        "detect-train", help="Train the ear bounding-box detector on iBUG Collection B (+ optional ear-only crops)"
+    )
+    detect_train_parser.add_argument("--source", required=True, help="CollectionB root (identity dirs with 4-pt .pts)")
+    detect_train_parser.add_argument("--ear-source", default="", help="Optional CollectionA root for ear-only samples")
+    detect_train_parser.add_argument("--output-dir", default="runs/earid-detect")
+    detect_train_parser.add_argument("--image-size", type=int, default=224)
+    detect_train_parser.add_argument("--batch-size", type=int, default=32)
+    detect_train_parser.add_argument("--epochs", type=int, default=30)
+    detect_train_parser.add_argument("--lr", type=float, default=3e-4)
+    detect_train_parser.add_argument("--patience", type=int, default=6)
+    detect_train_parser.add_argument("--num-workers", type=int, default=0)
+    detect_train_parser.add_argument("--device", default="cpu")
+    detect_train_parser.add_argument("--seed", type=int, default=42)
 
     align_run_parser = subparsers.add_parser(
         "align-run", help="Produce an aligned copy of an image corpus using a trained landmark model"
@@ -263,6 +282,7 @@ def main(argv: list[str] | None = None) -> None:
             args.device,
             args.batch_size,
             align_checkpoint=Path(args.align_checkpoint) if args.align_checkpoint else None,
+            detect_checkpoint=Path(args.detect_checkpoint) if args.detect_checkpoint else None,
         )
         print(json.dumps({"url": f"http://{args.host}:{args.port}", "checkpoint": args.checkpoint}))
         app.run(host=args.host, port=args.port)
@@ -274,6 +294,27 @@ def main(argv: list[str] | None = None) -> None:
         metrics = train_landmarks(
             AlignTrainConfig(
                 source=args.source,
+                output_dir=args.output_dir,
+                image_size=args.image_size,
+                batch_size=args.batch_size,
+                epochs=args.epochs,
+                lr=args.lr,
+                patience=args.patience,
+                num_workers=args.num_workers,
+                device=args.device,
+                seed=args.seed,
+            )
+        )
+        print(json.dumps(metrics, indent=2))
+        return
+
+    if args.command == "detect-train":
+        from .align import DetectTrainConfig, train_detector
+
+        metrics = train_detector(
+            DetectTrainConfig(
+                source=args.source,
+                ear_source=args.ear_source,
                 output_dir=args.output_dir,
                 image_size=args.image_size,
                 batch_size=args.batch_size,
