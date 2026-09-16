@@ -49,6 +49,21 @@ The larger and more diverse subject pool (multiple continents, capture
 conditions, and age ranges) improves generalizability to subjects the model
 has never seen — the regime that matters for investigative candidate-ranking.
 
+### Missing-persons cases
+
+Outer-ear morphometry is especially valuable for missing-persons work
+because the pinna's cartilage structure — the helix, antihelix, concha, and
+tragus geometry — stays remarkably consistent through aging. Unlike facial
+geometry, which shifts substantially with soft-tissue changes, weight,
+and age (a particular problem for children who go missing and are found
+years later), the ear's identifying structure is largely fixed after early
+childhood; only the lobe elongates gradually. A years-old reference photo
+can therefore still be matched against a current photo of the person. The
+age-progressed training corpus described above directly targets this
+scenario: the model learns to match the same ear across years of aging,
+making it a practical screening tool for long-gap identifications where
+face-based systems degrade.
+
 ## Forensic-grade evaluation, not just accuracy
 
 - **Subject-safe splits**: no identity's capture session appears in both
