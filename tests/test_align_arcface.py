@@ -136,3 +136,50 @@ def test_detector_dataset_mixed_kinds(tmp_path):
             assert target.shape == (4,)
             assert (target >= 0).all() and (target <= 1).all()
             assert target[0] <= target[2] and target[1] <= target[3]
+
+
+def test_assess_suitability_without_detector():
+    from PIL import Image
+
+    from earid.webui import assess_suitability
+
+    import numpy as np
+
+    rng = np.random.default_rng(0)
+    noisy = Image.fromarray(rng.integers(40, 215, size=(300, 300, 3), dtype=np.uint8))
+    report = assess_suitability(noisy)
+    assert 0 <= report["score"] <= 100
+    assert report["label"] in {"Excellent", "Good", "Fair", "Poor"}
+    names = [f["name"] for f in report["factors"]]
+    assert names == ["Image resolution", "Sharpness", "Exposure"]
+    assert all(0 <= f["score"] <= 1 for f in report["factors"])
+
+
+def test_assess_suitability_penalizes_bad_images():
+    from PIL import Image
+
+    from earid.webui import assess_suitability
+
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    sharp = Image.fromarray(rng.integers(30, 225, size=(400, 400, 3), dtype=np.uint8))
+    dark_blurry = Image.new("RGB", (50, 50), (3, 3, 3))
+    good = assess_suitability(sharp)
+    bad = assess_suitability(dark_blurry)
+    assert good["score"] > bad["score"]
+    assert bad["label"] == "Poor"
+
+
+def test_assess_suitability_with_detector():
+    from PIL import Image
+
+    from earid.align import build_detector_model
+    from earid.webui import assess_suitability
+
+    detector = build_detector_model(pretrained=False).eval()
+    image = Image.new("RGB", (640, 480), (120, 110, 100))
+    report = assess_suitability(image, detector, 224, torch.device("cpu"))
+    names = [f["name"] for f in report["factors"]]
+    assert names == ["Ear detectability", "Ear resolution", "Sharpness", "Exposure"]
+    assert 0 <= report["score"] <= 100
